@@ -1,4 +1,6 @@
-'use strict';
+import { collectSenderCandidates } from './scan-sender.js';
+import { CONFIDENT_SENDER_SCORE, cleanSenderName, rankSenders } from './sender.js';
+import { formatMailDate } from './mail-date.js';
 const status = document.getElementById('status');
 const preview = document.getElementById('preview');
 const copyBtn = document.getElementById('copy');
@@ -67,6 +69,8 @@ async function load() {
     const value = result?.[0]?.result;
     if (!value?.ok) throw new Error(value?.error || 'メールを取得できませんでした。');
     message = value;
+    message.sender = await detectSender(tab.id, value.sender);
+    message.date = formatMailDate(value.date) || '';
     render();
     // ボタンを押さなくても、取得できた時点でクリップボードへコピーする。
     await copyCurrent('open');
@@ -75,6 +79,28 @@ async function load() {
     status.textContent = e.message || String(e); status.classList.remove('ok'); status.classList.add('error');
     preview.textContent = 'Outlookで対象のメールを1件開いてから「再取得」を押してください。';
   }
+}
+// OLM-Achiver と同じ方法で差出人を判定する。画面上の複数の手がかり（差出人欄・
+// 選択中の一覧行・ヘッダー）から候補を集めて採点し、確信できる1件だけを採用する。
+// 確信できないときは本文取得時に直接読めた差出人を使い、それもなければ出さない。
+async function detectSender(tabId, fallback) {
+  let best = null;
+  try {
+    const results = await chrome.scripting.executeScript({ target: {tabId}, func: collectSenderCandidates });
+    const scan = results?.[0]?.result;
+    if (scan?.ok) [best] = rankSenders(scan);
+  } catch (e) {
+    console.warn('差出人の判定に失敗しました', e);
+  } finally {
+    // 本文に付けた目印を外す。
+    chrome.scripting.executeScript({ target: {tabId}, func: () => {
+      document.querySelectorAll('[data-osmc-target]').forEach(el => el.removeAttribute('data-osmc-target'));
+    } }).catch(() => {});
+  }
+  if (best && best.score >= CONFIDENT_SENDER_SCORE) {
+    return best.address && best.name !== best.address ? `${best.name} <${best.address}>` : best.name;
+  }
+  return cleanSenderName(fallback);
 }
 metadata.addEventListener('change', () => {
   render();
@@ -146,16 +172,29 @@ function extractCurrentMail(mode) {
   const candidates = bodySelectors.flatMap(sel => [...document.querySelectorAll(sel)].filter(visible));
   const bodies = [...new Set(candidates)].filter(el => !candidates.some(other => other !== el && el.contains(other)));
   const scopeOf = el => el.closest('[data-itemid], [data-message-id], [data-testid="message-container"], [role="article"]') || el.parentElement?.parentElement?.parentElement || document;
-  const dateElOf = scope => one(scope, [
-    '[data-testid="message-date"]', '[data-testid="sent-time"]',
-    'time[datetime]', '[title*="202"]'
-  ]);
+  // 日付と時刻として読める値だけを日時とみなす（添付ファイル名などの title を拾わない）。
+  const DATE_TIME = /\d{4}\s*(?:年|[-\/.])\s*\d{1,2}\s*(?:月|[-\/.])\s*\d{1,2}.*?\d{1,2}\s*[:：]\s*\d{2}|\d{1,2}\/\d{1,2}\/\d{4}\s+\d{1,2}:\d{2}/;
+  const dateTextOf = el => {
+    if (!el) return '';
+    for (const value of [el.getAttribute('datetime'), el.getAttribute('title'), el.innerText, el.getAttribute('aria-label')]) {
+      const v = (value || '').trim();
+      if (v && v.length <= 80 && (DATE_TIME.test(v) || (el.matches('time[datetime]') && !isNaN(Date.parse(v))))) return v;
+    }
+    return '';
+  };
+  const dateElOf = scope => {
+    for (const selector of ['[data-testid="message-date"]', '[data-testid="sent-time"]', 'time[datetime]', '[title]']) {
+      const found = [...scope.querySelectorAll(selector)].filter(visible).find(el => dateTextOf(el));
+      if (found) return found;
+    }
+    return null;
+  };
   // Outlookの表示日時（日本語・英語表記）を数値化する。判定できなければ NaN。
   const toTime = el => {
     if (!el) return NaN;
     const attr = el.getAttribute('datetime');
     if (attr && !isNaN(Date.parse(attr))) return Date.parse(attr);
-    const t = `${el.innerText || ''} ${el.title || ''}`;
+    const t = dateTextOf(el);
     let m = t.match(/(\d{4})[\/\-.年](\d{1,2})[\/\-.月](\d{1,2})日?[^\d]*?(\d{1,2}):(\d{2})/);
     if (m) return new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5]).getTime();
     m = t.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
@@ -226,16 +265,21 @@ function extractCurrentMail(mode) {
   if (!body) return {ok:false,error:'本文が空か、取得できませんでした。'};
   if (latestOnly) body = keepRecent(body);
   const scope = scopeOf(bodyEl);
+  // 差出人の判定（scan-sender.js）が同じ1件を見られるよう、選んだ本文に目印を付ける。
+  document.querySelectorAll('[data-osmc-target]').forEach(el => el.removeAttribute('data-osmc-target'));
+  bodyEl.setAttribute('data-osmc-target', '1');
   const subjectEl = one(document, [
     '[data-testid="message-subject"]', '[data-testid="mail-subject"]',
     '[data-app-section="MailReadCompose"] [role="heading"]',
-    '[data-app-section="MailReadCompose"] h1'
+    '[data-app-section="MailReadCompose"] h1',
+    'h1[title]', '[role="heading"][aria-level="2"]'
   ]);
   const senderEl = one(scope, [
-    '[data-testid="message-sender"]', '[data-testid="sender-name"]',
+    '[id$="_FROM"]', '[data-testid="message-sender"]', '[data-testid="sender-name"]',
     '[data-testid="sender-email"]', '[aria-label^="差出人:"]', '[aria-label^="From:"]'
   ]);
   const dateEl = dateElOf(scope);
-  return {ok:true,notes,subject:clean(subjectEl?.innerText),sender:clean(senderEl?.innerText || senderEl?.getAttribute('aria-label')),
-    date:clean(dateEl?.getAttribute('datetime') || dateEl?.innerText || dateEl?.title),body};
+  const subject = clean(subjectEl?.innerText) || clean(document.title.replace(/^(メール|Mail)\s*-\s*/i, '').replace(/\s*-\s*Outlook$/i, ''));
+  return {ok:true,notes,subject,sender:clean(senderEl?.innerText || senderEl?.getAttribute('aria-label')),
+    date:dateTextOf(dateEl),body};
 }
