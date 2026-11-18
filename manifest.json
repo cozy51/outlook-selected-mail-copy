@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Outlook 選択メールコピー",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Outlook Webで開いているメール1件だけを確認してクリップボードにコピーします。",
   "permissions": [
     "activeTab",

@@ -5,6 +5,7 @@ const copyBtn = document.getElementById('copy');
 const reloadBtn = document.getElementById('reload');
 const metadata = document.getElementById('metadata');
 let message = null;
+let copiedText = null; // 最後にクリップボードへ書き込んだ内容
 function format(m) {
   if (!metadata.checked) return m.body;
   // 取得できなかった項目は見出しも含めて表示しない。
@@ -19,10 +20,42 @@ function format(m) {
 function render() {
   preview.textContent = message ? format(message) : '対象メールがありません。';
   copyBtn.disabled = !message;
+  updateCopiedState();
+}
+// 表示中の内容がコピー済みかどうかをボタン・プレビューに反映する。
+function updateCopiedState() {
+  const copied = !!message && copiedText === format(message);
+  copyBtn.textContent = copied ? '✓ コピー済み' : 'この1件をコピー';
+  copyBtn.classList.toggle('copied', copied);
+  preview.classList.toggle('copied', copied);
+}
+// reason: 'open'（取得直後の自動コピー）/ 'switch'（形式切替）/ 'manual'（ボタン）
+async function copyCurrent(reason) {
+  const auto = reason !== 'manual';
+  if (!message) return;
+  const text = format(message);
+  try {
+    await navigator.clipboard.writeText(text);
+    copiedText = text;
+    status.textContent = {
+      open: '開いた時点でこのメール1件をコピーしました。',
+      switch: '切り替え後の内容でコピーし直しました。',
+      manual: 'このメール1件をコピーしました。'
+    }[reason];
+    status.classList.remove('error'); status.classList.add('ok');
+  } catch (e) {
+    copiedText = null;
+    status.textContent = auto
+      ? `自動コピーできませんでした（${e.message}）。「この1件をコピー」を押してください。`
+      : `コピー失敗: ${e.message}`;
+    status.classList.remove('ok'); status.classList.add('error');
+  }
+  updateCopiedState();
 }
 async function load() {
-  message = null; copyBtn.disabled = true;
-  status.textContent = '選択中のメールを確認しています…'; status.classList.remove('error');
+  message = null; copiedText = null; copyBtn.disabled = true;
+  updateCopiedState();
+  status.textContent = '選択中のメールを確認しています…'; status.classList.remove('error', 'ok');
   preview.textContent = '取得中…';
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -33,28 +66,25 @@ async function load() {
     const value = result?.[0]?.result;
     if (!value?.ok) throw new Error(value?.error || 'メールを取得できませんでした。');
     message = value;
-    status.textContent = '読み取り内容を確認してコピーしてください。';
     render();
+    // ボタンを押さなくても、取得できた時点でクリップボードへコピーする。
+    await copyCurrent('open');
   } catch (e) {
-    status.textContent = e.message || String(e); status.classList.add('error');
+    status.textContent = e.message || String(e); status.classList.remove('ok'); status.classList.add('error');
     preview.textContent = 'Outlookで対象のメールを1件開いてから「再取得」を押してください。';
   }
 }
 metadata.addEventListener('change', () => {
   render();
+  // 形式を切り替えたら、切り替え後の内容でコピーし直す。
+  if (message) copyCurrent('switch');
   chrome.storage.local.set({ includeMetadata: metadata.checked }).catch(e => {
     status.textContent = `設定を保存できませんでした: ${e.message}`;
     status.classList.add('error');
   });
 });
 reloadBtn.addEventListener('click', load);
-copyBtn.addEventListener('click', async () => {
-  if (!message) return;
-  try {
-    await navigator.clipboard.writeText(format(message));
-    status.textContent = 'このメール1件をコピーしました。'; status.classList.remove('error');
-  } catch (e) { status.textContent = `コピー失敗: ${e.message}`; status.classList.add('error'); }
-});
+copyBtn.addEventListener('click', () => copyCurrent('manual'));
 // 前回のチェック状態を復元してからメールを読み取る。
 (async () => {
   try {
