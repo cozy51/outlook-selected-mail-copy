@@ -101,7 +101,9 @@ copyBtn.addEventListener('click', () => copyCurrent('manual'));
     const saved = await chrome.storage.local.get(['includeMetadata', 'targetMode']);
     if (typeof saved.includeMetadata === 'boolean') metadata.checked = saved.includeMetadata;
     // 未設定のときは「最新メールのみ」を初期値とする。
-    if (saved.targetMode === 'latest' || saved.targetMode === 'opened') target.value = saved.targetMode;
+    // 旧バージョンの保存値（latest / opened）も読み替える。
+    const mode = { latest: '1', opened: 'all' }[saved.targetMode] || saved.targetMode;
+    if ([...target.options].some(o => o.value === mode)) target.value = mode;
   } catch (e) {
     status.textContent = `設定の読み込みに失敗しました: ${e.message}`;
     status.classList.add('error');
@@ -110,9 +112,10 @@ copyBtn.addEventListener('click', () => copyCurrent('manual'));
 })();
 
 // Outlookの表示DOMは変更されるため、本文を安全に特定できないときはコピーしない。
-// mode: 'latest'（最新メールのみ）/ 'opened'（開いているメール1件をそのまま）
+// mode: '1'〜'5'（最新から何件目まで含めるか。'1'＝最新メールのみ）/ 'all'（開いているメール1件をそのまま）
 function extractCurrentMail(mode) {
-  const latestOnly = mode !== 'opened';
+  const latestOnly = mode !== 'all';
+  const depth = latestOnly ? Math.max(1, parseInt(mode, 10) || 1) : Infinity;
   const notes = [];
   const visible = el => {
     if (!el || !(el instanceof HTMLElement)) return false;
@@ -162,12 +165,13 @@ function extractCurrentMail(mode) {
     }
     return NaN;
   };
-  // 返信・転送で本文に付く過去のやり取り（引用部分）の開始行を探して切り落とす。
-  const stripQuoted = text => {
+  // 返信・転送で本文に付く過去のやり取り（引用部分）の区切り行を探し、
+  // 最新から depth 件目までを残して、それより古いやり取りを切り落とす。
+  const keepRecent = text => {
     const lines = text.split('\n');
     const near = (i, re) => lines.slice(i + 1, i + 6).some(l => re.test(l.trim()));
     const headerNext = /^(Sent|Date|To|Subject|送信日時|日時|宛先|件名)\s*[:：]/i;
-    const idx = lines.findIndex((raw, i) => {
+    const isBoundary = (raw, i) => {
       const l = raw.trim();
       if (i === 0) return false;
       if (/^-{2,}\s*(Original Message|元のメッセージ|オリジナル\s*メッセージ)\s*-{2,}$/i.test(l)) return true;
@@ -176,11 +180,27 @@ function extractCurrentMail(mode) {
       if (/^On .+wrote:$/i.test(l)) return true;
       if (/^>/.test(l) && lines.slice(i).filter(x => x.trim()).every(x => /^>/.test(x.trim()))) return true;
       return false;
+    };
+    // 「____」や「-----Original Message-----」の直後にある「差出人:」は同じ区切りとして1つにまとめる。
+    const boundaries = [];
+    lines.forEach((raw, i) => {
+      if (!isBoundary(raw, i)) return;
+      const last = boundaries[boundaries.length - 1];
+      if (last !== undefined && i - last <= 6 && !lines.slice(last + 1, i).some(x => x.trim() && !/^[_\-\s]+$/.test(x) && !/^(From|差出人|送信者|Sent|Date|To|Cc|Subject|送信日時|日時|宛先|件名)\s*[:：]/i.test(x.trim()))) return;
+      boundaries.push(i);
     });
-    if (idx <= 0) return text;
-    const head = clean(lines.slice(0, idx).join('\n'));
+    const available = boundaries.length + 1; // 最新を含めたやり取りの件数
+    if (depth >= available) {
+      if (depth > 1 && boundaries.length) {
+        notes.push(depth === available
+          ? `${depth - 1}件前までのやり取りを含めました`
+          : `引用は${boundaries.length}件前までだったため全件を含めました`);
+      }
+      return text;
+    }
+    const head = clean(lines.slice(0, boundaries[depth - 1]).join('\n'));
     if (!head) return text;
-    notes.push('過去のやり取りの引用部分を除きました');
+    notes.push(depth === 1 ? '過去のやり取りの引用部分を除きました' : `${depth - 1}件前までのやり取りを含めました`);
     return head;
   };
   if (bodies.length === 0) {
@@ -204,7 +224,7 @@ function extractCurrentMail(mode) {
   }
   let body = clean(bodyEl.innerText);
   if (!body) return {ok:false,error:'本文が空か、取得できませんでした。'};
-  if (latestOnly) body = stripQuoted(body);
+  if (latestOnly) body = keepRecent(body);
   const scope = scopeOf(bodyEl);
   const subjectEl = one(document, [
     '[data-testid="message-subject"]', '[data-testid="mail-subject"]',
