@@ -4,6 +4,7 @@ const preview = document.getElementById('preview');
 const copyBtn = document.getElementById('copy');
 const reloadBtn = document.getElementById('reload');
 const metadata = document.getElementById('metadata');
+const target = document.getElementById('target');
 let message = null;
 let copiedText = null; // 最後にクリップボードへ書き込んだ内容
 function format(m) {
@@ -62,13 +63,14 @@ async function load() {
     if (!tab?.id || !/^https:\/\/(outlook\.office\.com|outlook\.office365\.com|outlook\.live\.com|outlook\.cloud\.microsoft)(\/|$)/i.test(tab.url || '')) {
       throw new Error('OutlookのWeb版を開いてください。');
     }
-    const result = await chrome.scripting.executeScript({ target: {tabId: tab.id}, func: extractCurrentMail });
+    const result = await chrome.scripting.executeScript({ target: {tabId: tab.id}, func: extractCurrentMail, args: [target.value] });
     const value = result?.[0]?.result;
     if (!value?.ok) throw new Error(value?.error || 'メールを取得できませんでした。');
     message = value;
     render();
     // ボタンを押さなくても、取得できた時点でクリップボードへコピーする。
     await copyCurrent('open');
+    if (value.notes?.length && status.classList.contains('ok')) status.textContent += `（${value.notes.join('、')}）`;
   } catch (e) {
     status.textContent = e.message || String(e); status.classList.remove('ok'); status.classList.add('error');
     preview.textContent = 'Outlookで対象のメールを1件開いてから「再取得」を押してください。';
@@ -83,13 +85,23 @@ metadata.addEventListener('change', () => {
     status.classList.add('error');
   });
 });
+target.addEventListener('change', () => {
+  chrome.storage.local.set({ targetMode: target.value }).catch(e => {
+    status.textContent = `設定を保存できませんでした: ${e.message}`;
+    status.classList.add('error');
+  });
+  // 対象の決め方が変わるので読み取りからやり直す。
+  load();
+});
 reloadBtn.addEventListener('click', load);
 copyBtn.addEventListener('click', () => copyCurrent('manual'));
 // 前回のチェック状態を復元してからメールを読み取る。
 (async () => {
   try {
-    const saved = await chrome.storage.local.get('includeMetadata');
+    const saved = await chrome.storage.local.get(['includeMetadata', 'targetMode']);
     if (typeof saved.includeMetadata === 'boolean') metadata.checked = saved.includeMetadata;
+    // 未設定のときは「最新メールのみ」を初期値とする。
+    if (saved.targetMode === 'latest' || saved.targetMode === 'opened') target.value = saved.targetMode;
   } catch (e) {
     status.textContent = `設定の読み込みに失敗しました: ${e.message}`;
     status.classList.add('error');
@@ -98,7 +110,10 @@ copyBtn.addEventListener('click', () => copyCurrent('manual'));
 })();
 
 // Outlookの表示DOMは変更されるため、本文を安全に特定できないときはコピーしない。
-function extractCurrentMail() {
+// mode: 'latest'（最新メールのみ）/ 'opened'（開いているメール1件をそのまま）
+function extractCurrentMail(mode) {
+  const latestOnly = mode !== 'opened';
+  const notes = [];
   const visible = el => {
     if (!el || !(el instanceof HTMLElement)) return false;
     const s = getComputedStyle(el), r = el.getBoundingClientRect();
@@ -127,16 +142,70 @@ function extractCurrentMail() {
   ];
   const candidates = bodySelectors.flatMap(sel => [...document.querySelectorAll(sel)].filter(visible));
   const bodies = [...new Set(candidates)].filter(el => !candidates.some(other => other !== el && el.contains(other)));
-  // スレッド中の複数メッセージが展開されている場合、1件だけに絞れないので拒否。
-  if (bodies.length !== 1) {
-    return {ok:false,error:bodies.length === 0
-      ? 'メール本文を特定できません。メールを開くか、Outlookの表示形式に合わせた調整が必要です。'
-      : '本文が複数見つかりました。スレッド内でコピー対象1件だけを展開してください。'};
+  const scopeOf = el => el.closest('[data-itemid], [data-message-id], [data-testid="message-container"], [role="article"]') || el.parentElement?.parentElement?.parentElement || document;
+  const dateElOf = scope => one(scope, [
+    '[data-testid="message-date"]', '[data-testid="sent-time"]',
+    'time[datetime]', '[title*="202"]'
+  ]);
+  // Outlookの表示日時（日本語・英語表記）を数値化する。判定できなければ NaN。
+  const toTime = el => {
+    if (!el) return NaN;
+    const attr = el.getAttribute('datetime');
+    if (attr && !isNaN(Date.parse(attr))) return Date.parse(attr);
+    const t = `${el.innerText || ''} ${el.title || ''}`;
+    let m = t.match(/(\d{4})[\/\-.年](\d{1,2})[\/\-.月](\d{1,2})日?[^\d]*?(\d{1,2}):(\d{2})/);
+    if (m) return new Date(+m[1], m[2] - 1, +m[3], +m[4], +m[5]).getTime();
+    m = t.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+    if (m) {
+      let h = +m[4] % 12; if (/pm/i.test(m[6] || '')) h += 12; else if (!m[6]) h = +m[4];
+      return new Date(+m[3], m[1] - 1, +m[2], h, +m[5]).getTime();
+    }
+    return NaN;
+  };
+  // 返信・転送で本文に付く過去のやり取り（引用部分）の開始行を探して切り落とす。
+  const stripQuoted = text => {
+    const lines = text.split('\n');
+    const near = (i, re) => lines.slice(i + 1, i + 6).some(l => re.test(l.trim()));
+    const headerNext = /^(Sent|Date|To|Subject|送信日時|日時|宛先|件名)\s*[:：]/i;
+    const idx = lines.findIndex((raw, i) => {
+      const l = raw.trim();
+      if (i === 0) return false;
+      if (/^-{2,}\s*(Original Message|元のメッセージ|オリジナル\s*メッセージ)\s*-{2,}$/i.test(l)) return true;
+      if (/^_{8,}$/.test(l) && near(i, /^(From|差出人|送信者)\s*[:：]/i)) return true;
+      if (/^(From|差出人|送信者)\s*[:：]/i.test(l) && near(i, headerNext)) return true;
+      if (/^On .+wrote:$/i.test(l)) return true;
+      if (/^>/.test(l) && lines.slice(i).filter(x => x.trim()).every(x => /^>/.test(x.trim()))) return true;
+      return false;
+    });
+    if (idx <= 0) return text;
+    const head = clean(lines.slice(0, idx).join('\n'));
+    if (!head) return text;
+    notes.push('過去のやり取りの引用部分を除きました');
+    return head;
+  };
+  if (bodies.length === 0) {
+    return {ok:false,error:'メール本文を特定できません。メールを開くか、Outlookの表示形式に合わせた調整が必要です。'};
   }
-  const bodyEl = bodies[0];
-  const body = clean(bodyEl.innerText);
+  let bodyEl = bodies[0];
+  if (bodies.length > 1) {
+    // 「開いているメール」モードでは1件に絞れないので拒否する。
+    if (!latestOnly) return {ok:false,error:'本文が複数見つかりました。スレッド内でコピー対象1件だけを展開してください。'};
+    // 「最新メールのみ」モードでは日時が最も新しい1件を選ぶ。日時が読めないものがあれば誤選択を避けて停止。
+    const timed = bodies.map(el => ({el, time: toTime(dateElOf(scopeOf(el)))}));
+    if (timed.some(x => isNaN(x.time))) {
+      return {ok:false,error:'スレッド内のメールの日時を判定できず、最新の1件を特定できません。最新のメールだけを展開してください。'};
+    }
+    timed.sort((a, b) => b.time - a.time);
+    if (timed[0].time === timed[1].time) {
+      return {ok:false,error:'同じ日時のメールが複数あり、最新の1件を特定できません。対象1件だけを展開してください。'};
+    }
+    bodyEl = timed[0].el;
+    notes.push(`展開中の${bodies.length}件から最新の1件を選びました`);
+  }
+  let body = clean(bodyEl.innerText);
   if (!body) return {ok:false,error:'本文が空か、取得できませんでした。'};
-  const scope = bodyEl.closest('[data-itemid], [data-message-id], [data-testid="message-container"], [role="article"]') || bodyEl.parentElement?.parentElement?.parentElement || document;
+  if (latestOnly) body = stripQuoted(body);
+  const scope = scopeOf(bodyEl);
   const subjectEl = one(document, [
     '[data-testid="message-subject"]', '[data-testid="mail-subject"]',
     '[data-app-section="MailReadCompose"] [role="heading"]',
@@ -146,10 +215,7 @@ function extractCurrentMail() {
     '[data-testid="message-sender"]', '[data-testid="sender-name"]',
     '[data-testid="sender-email"]', '[aria-label^="差出人:"]', '[aria-label^="From:"]'
   ]);
-  const dateEl = one(scope, [
-    '[data-testid="message-date"]', '[data-testid="sent-time"]',
-    'time[datetime]', '[title*="202"]'
-  ]);
-  return {ok:true,subject:clean(subjectEl?.innerText),sender:clean(senderEl?.innerText || senderEl?.getAttribute('aria-label')),
+  const dateEl = dateElOf(scope);
+  return {ok:true,notes,subject:clean(subjectEl?.innerText),sender:clean(senderEl?.innerText || senderEl?.getAttribute('aria-label')),
     date:clean(dateEl?.getAttribute('datetime') || dateEl?.innerText || dateEl?.title),body};
 }
